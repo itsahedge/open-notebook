@@ -117,12 +117,17 @@ OAUTH_PROVIDERS: Dict[str, OAuthProviderConfig] = {
     ),
     "anthropic": OAuthProviderConfig(
         provider="anthropic",
-        # Placeholder URLs — Anthropic OAuth is not yet publicly available
+        # Anthropic uses a setup-token paste flow instead of a full OAuth dance.
+        # Users run `claude setup-token` to generate an sk-ant-oat01-... token,
+        # then paste it via POST /api/oauth/anthropic/setup-token.
+        # The token works directly as an API key against api.anthropic.com.
+        # These placeholder URLs exist only to satisfy the dataclass; they are
+        # never called for the setup-token flow.
         auth_url="https://auth.anthropic.com/oauth/authorize",
         token_url="https://auth.anthropic.com/oauth/token",
         scopes=["claude.chat"],
         api_base_url="https://api.anthropic.com/v1",
-        use_pkce=True,
+        use_pkce=False,
         client_id_env="ANTHROPIC_OAUTH_CLIENT_ID",
         client_secret_env="ANTHROPIC_OAUTH_CLIENT_SECRET",
     ),

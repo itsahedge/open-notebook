@@ -673,6 +673,15 @@ class RegisterModelsResponse(BaseModel):
 
 
 # OAuth models
+class AnthropicSetupTokenRequest(BaseModel):
+    """Request to submit an Anthropic Claude Code setup-token."""
+
+    token: str = Field(..., description="Claude Code setup-token (sk-ant-oat01-...)")
+    name: Optional[str] = Field(
+        "Anthropic (Claude Code)", description="Credential name"
+    )
+
+
 class OAuthAuthorizeResponse(BaseModel):
     """Response with the OAuth authorization URL."""
 

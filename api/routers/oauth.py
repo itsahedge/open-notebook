@@ -37,6 +37,7 @@ from api.credentials_service import (
     require_encryption_key,
 )
 from api.models import (
+    AnthropicSetupTokenRequest,
     CredentialResponse,
     OAuthAuthorizeResponse,
     OAuthCallbackRequest,
@@ -54,6 +55,103 @@ from open_notebook.auth.oauth_providers import (
 from open_notebook.domain.credential import Credential
 
 router = APIRouter(prefix="/oauth", tags=["oauth"])
+
+# =============================================================================
+# Anthropic Claude Code setup-token (paste flow, no OAuth dance)
+# =============================================================================
+
+# Common Claude models to auto-register after credential creation
+ANTHROPIC_SETUP_TOKEN_MODELS = [
+    ("claude-opus-4-20250514", "language"),
+    ("claude-sonnet-4-20250514", "language"),
+    ("claude-3-5-haiku-20241022", "language"),
+]
+
+
+@router.post("/anthropic/setup-token", response_model=CredentialResponse, status_code=201)
+async def anthropic_setup_token(request: AnthropicSetupTokenRequest):
+    """
+    Accept an Anthropic Claude Code setup-token and create a credential.
+
+    Users generate this token by running `claude setup-token` on their machine.
+    The token (sk-ant-oat01-...) works directly as an API key against
+    api.anthropic.com — no OAuth dance or adapter needed.
+
+    After creating the credential, common Claude models are auto-registered.
+    """
+    try:
+        require_encryption_key()
+
+        # Validate token format
+        token = request.token.strip()
+        if not token.startswith("sk-ant-oat01-"):
+            raise ValueError(
+                "Invalid setup-token format. "
+                "Token must start with 'sk-ant-oat01-'. "
+                "Generate one by running: claude setup-token"
+            )
+        if len(token) < 80:
+            raise ValueError(
+                "Invalid setup-token: too short. "
+                "A valid Claude Code setup-token is at least 80 characters. "
+                "Generate one by running: claude setup-token"
+            )
+
+        credential_name = request.name or "Anthropic (Claude Code)"
+
+        # Create credential — the setup-token IS the API key
+        cred = Credential(
+            name=credential_name,
+            provider="anthropic",
+            modalities=get_default_modalities("anthropic"),
+            auth_type="oauth",  # Indicates it came from setup-token/OAuth, not Console key
+            api_key=SecretStr(token),
+        )
+        await cred.save()
+        logger.info(f"Created Anthropic setup-token credential: {cred.id}")
+
+        # Auto-register common Claude models
+        from open_notebook.ai.models import Model
+        from open_notebook.database.repository import repo_query
+
+        existing_models = await repo_query(
+            "SELECT string::lowercase(name) as name, string::lowercase(type) as type "
+            "FROM model WHERE string::lowercase(provider) = 'anthropic'",
+            {},
+        )
+        existing_keys = {(m["name"], m["type"]) for m in existing_models}
+
+        registered = 0
+        for model_name, model_type in ANTHROPIC_SETUP_TOKEN_MODELS:
+            if (model_name.lower(), model_type.lower()) in existing_keys:
+                continue
+            new_model = Model(
+                name=model_name,
+                provider="anthropic",
+                type=model_type,
+                credential=cred.id,
+            )
+            await new_model.save()
+            registered += 1
+
+        if registered:
+            logger.info(
+                f"Auto-registered {registered} Anthropic model(s) "
+                f"for credential {cred.id}"
+            )
+
+        return credential_to_response(cred)
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Anthropic setup-token error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save setup-token credential")
+
+
+# =============================================================================
+# Standard OAuth flows (authorize / callback / refresh)
+# =============================================================================
 
 
 @router.get("/{provider}/authorize", response_model=OAuthAuthorizeResponse)

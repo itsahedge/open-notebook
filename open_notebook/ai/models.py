@@ -123,8 +123,9 @@ class ModelManager:
             credential = await model.get_credential_obj()
             if credential:
                 config = credential.to_esperanto_config()
-                logger.debug(
-                    f"Using credential '{credential.name}' for model {model.name}"
+                logger.info(
+                    f"Using credential '{credential.name}' (auth_type={credential.auth_type}) for model {model.name}. "
+                    f"Config keys: {list(config.keys())}. Has api_key: {'api_key' in config}"
                 )
             else:
                 logger.warning(
@@ -143,6 +144,54 @@ class ModelManager:
 
         # Merge any additional kwargs (e.g. temperature)
         config.update(kwargs)
+
+        # -----------------------------------------------------------------
+        # ChatGPT backend detection: if the credential is OAuth with a
+        # chatgpt.com base URL and no exchanged API key, route through
+        # the built-in ChatGPT Responses API adapter instead of Esperanto.
+        # -----------------------------------------------------------------
+        if (
+            model.type == "language"
+            and model.credential
+            and credential is not None
+            and credential.auth_type == "oauth"
+            and not credential.oauth_api_key
+            and credential.oauth_base_url
+            and "chatgpt.com" in credential.oauth_base_url
+        ):
+            # Ensure OAuth token is fresh before using it
+            from open_notebook.ai.key_provider import _refresh_oauth_token_if_needed
+
+            credential = await _refresh_oauth_token_if_needed(credential)
+            # Re-extract config after potential refresh
+            config = credential.to_esperanto_config()
+            config.update(kwargs)
+
+            access_token = config.get("api_key", "")
+            account_id = config.get("chatgpt_account_id", "") or (
+                credential.oauth_account_id or ""
+            )
+            if access_token and account_id:
+                from open_notebook.auth.chatgpt_langchain import (
+                    ChatGPTLanguageModelWrapper,
+                )
+
+                logger.info(
+                    f"Using ChatGPT Responses API adapter for model {model.name} "
+                    f"(account_id={account_id[:8]}...)"
+                )
+                return ChatGPTLanguageModelWrapper(
+                    model_name=model.name,
+                    access_token=access_token,
+                    account_id=account_id,
+                    temperature=config.get("temperature", 0.7),
+                    max_tokens=config.get("max_tokens", 16384),
+                )
+            else:
+                logger.warning(
+                    f"ChatGPT backend credential for model {model.name} is missing "
+                    f"access_token or account_id — falling through to Esperanto."
+                )
 
         # Normalize provider name: DB stores underscores but Esperanto expects hyphens
         provider = model.provider.replace("_", "-")

@@ -84,6 +84,7 @@ async def oauth_authorize(provider: str, redirect_uri: str):
         return OAuthAuthorizeResponse(
             authorize_url=authorize_url,
             state=state,
+            code_verifier=code_verifier if config.use_pkce else None,
         )
 
     except ValueError as e:

@@ -36,6 +36,8 @@ services:
       - SURREAL_DATABASE=open_notebook
     volumes:
       - ./notebook_data:/app/data
+      - ./open_notebook:/app/open_notebook
+      - ./api:/app/api
     depends_on:
       - surrealdb
     restart: always

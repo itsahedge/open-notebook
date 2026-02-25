@@ -255,10 +255,14 @@ async def chatgpt_chat_completion(
         "parallel_tool_calls": False,
         "store": False,
         "stream": True,  # ChatGPT backend REQUIRES streaming
+        "include": ["reasoning.encrypted_content"],
+        "reasoning": {
+            "effort": "low",
+            "summary": "auto",
+        },
     }
 
-    if temperature is not None:
-        payload["temperature"] = temperature
+    # Note: ChatGPT Responses API does NOT support temperature parameter
 
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -292,8 +296,11 @@ async def chatgpt_chat_completion(
             ) as response:
                 if response.status_code >= 400:
                     body = await response.aread()
+                    body_str = body.decode("utf-8", errors="ignore")
+                    logger.error(f"ChatGPT adapter: raw error body: {body_str[:2000]}")
+                    logger.error(f"ChatGPT adapter: sent payload model={normalised_model}, input_items={len(input_items)}, instructions_len={len(instructions) if instructions else 0}")
                     try:
-                        err_body = json.loads(body.decode("utf-8", errors="ignore"))
+                        err_body = json.loads(body_str)
                         err_msg = (
                             err_body.get("error", {}).get("message")
                             or f"Upstream error (HTTP {response.status_code})"

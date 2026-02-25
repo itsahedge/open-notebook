@@ -678,6 +678,9 @@ class OAuthAuthorizeResponse(BaseModel):
 
     authorize_url: str = Field(..., description="URL to redirect user for OAuth authorization")
     state: str = Field(..., description="CSRF state parameter to verify on callback")
+    code_verifier: Optional[str] = Field(
+        None, description="PKCE code verifier (client must send this back in the callback)"
+    )
 
 
 class OAuthCallbackRequest(BaseModel):

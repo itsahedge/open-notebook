@@ -199,7 +199,7 @@ def require_encryption_key() -> None:
 
 
 def credential_to_response(cred: Credential, model_count: int = 0) -> CredentialResponse:
-    """Convert a Credential domain object to API response."""
+    """Convert a Credential domain object to API response (never includes secrets)."""
     return CredentialResponse(
         id=cred.id or "",
         name=cred.name,
@@ -219,6 +219,17 @@ def credential_to_response(cred: Credential, model_count: int = 0) -> Credential
         created=str(cred.created) if cred.created else "",
         updated=str(cred.updated) if cred.updated else "",
         model_count=model_count,
+        auth_type=cred.auth_type,
+        oauth_provider=cred.oauth_provider,
+        has_oauth_tokens=cred.oauth_access_token is not None,
+        oauth_token_expiry=(
+            str(cred.oauth_token_expiry) if cred.oauth_token_expiry else None
+        ),
+        oauth_path=(
+            "api_key" if cred.oauth_api_key
+            else "chatgpt_backend" if (cred.auth_type == "oauth" and cred.oauth_access_token)
+            else None
+        ),
     )
 
 

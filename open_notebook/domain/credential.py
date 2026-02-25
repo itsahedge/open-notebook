@@ -15,7 +15,7 @@ Usage:
     await cred.save()
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, ClassVar, Dict, List, Optional
 
 from loguru import logger
@@ -47,6 +47,14 @@ class Credential(ObjectModel):
         "project",
         "location",
         "credentials_path",
+        "oauth_access_token",
+        "oauth_refresh_token",
+        "oauth_token_expiry",
+        "oauth_provider",
+        "oauth_client_id",
+        "oauth_base_url",
+        "oauth_api_key",
+        "oauth_account_id",
     }
 
     name: str
@@ -64,17 +72,60 @@ class Credential(ObjectModel):
     location: Optional[str] = None
     credentials_path: Optional[str] = None
 
+    # OAuth fields
+    auth_type: str = "api_key"  # "api_key" or "oauth"
+    oauth_access_token: Optional[SecretStr] = None
+    oauth_refresh_token: Optional[SecretStr] = None
+    oauth_token_expiry: Optional[datetime] = None
+    oauth_provider: Optional[str] = None  # "openai", "anthropic", etc.
+    oauth_client_id: Optional[str] = None
+    oauth_base_url: Optional[str] = None  # base URL for OAuth-authenticated requests
+    # OpenAI two-path fields:
+    # oauth_api_key: exchanged API key (if token-exchange grant succeeded → standard API path)
+    # oauth_account_id: chatgpt_account_id from JWT (needed for ChatGPT backend path)
+    oauth_api_key: Optional[SecretStr] = None
+    oauth_account_id: Optional[str] = None
+
     def to_esperanto_config(self) -> Dict[str, Any]:
         """
         Build config dict for AIFactory.create_*() calls.
 
         Returns a dict that can be passed as the 'config' parameter to
         Esperanto's AIFactory methods, overriding env var lookup.
+
+        For OAuth credentials, resolves one of two paths:
+
+        1. **API key path** (oauth_api_key is set): The token-exchange grant
+           succeeded — use the exchanged API key against the standard
+           api.openai.com endpoint. This behaves identically to a normal
+           API key credential.
+
+        2. **ChatGPT backend path** (oauth_api_key is NOT set): The account
+           is ChatGPT-only — use the OAuth access_token as Bearer auth
+           against the ChatGPT backend (oauth_base_url). The caller may
+           also need oauth_account_id for the chatgpt-account-id header.
         """
         config: Dict[str, Any] = {}
-        if self.api_key:
+
+        if self.auth_type == "oauth":
+            if self.oauth_api_key:
+                # Path 1: exchanged API key → standard API endpoint
+                config["api_key"] = self.oauth_api_key.get_secret_value()
+                # base_url stays default (api.openai.com/v1) — don't set it
+                # so that Esperanto uses the provider's normal base URL.
+            elif self.oauth_access_token:
+                # Path 2: ChatGPT backend — access_token as API key,
+                # different base_url
+                config["api_key"] = self.oauth_access_token.get_secret_value()
+                if self.oauth_base_url:
+                    config["base_url"] = self.oauth_base_url
+                # Pass account ID as extra config for callers that need it
+                if self.oauth_account_id:
+                    config["chatgpt_account_id"] = self.oauth_account_id
+        elif self.api_key:
             config["api_key"] = self.api_key.get_secret_value()
-        if self.base_url:
+
+        if self.base_url and "base_url" not in config:
             config["base_url"] = self.base_url
         if self.endpoint:
             config["endpoint"] = self.endpoint
@@ -114,10 +165,9 @@ class Credential(ObjectModel):
 
     @classmethod
     async def get(cls, id: str) -> "Credential":
-        """Override get() to handle api_key decryption."""
+        """Override get() to handle api_key and OAuth token decryption."""
         instance = await super().get(id)
-        # Pydantic auto-wraps the raw DB string in SecretStr, so we need
-        # to extract, decrypt, and re-wrap regardless of type.
+        # Decrypt api_key
         if instance.api_key:
             raw = (
                 instance.api_key.get_secret_value()
@@ -126,11 +176,22 @@ class Credential(ObjectModel):
             )
             decrypted = decrypt_value(raw)
             object.__setattr__(instance, "api_key", SecretStr(decrypted))
+        # Decrypt OAuth secret fields
+        for token_field in ("oauth_access_token", "oauth_refresh_token", "oauth_api_key"):
+            token_val = getattr(instance, token_field, None)
+            if token_val:
+                raw = (
+                    token_val.get_secret_value()
+                    if isinstance(token_val, SecretStr)
+                    else token_val
+                )
+                decrypted = decrypt_value(raw)
+                object.__setattr__(instance, token_field, SecretStr(decrypted))
         return instance
 
     @classmethod
     async def get_all(cls, order_by=None) -> List["Credential"]:
-        """Override get_all() to handle api_key decryption."""
+        """Override get_all() to handle api_key and OAuth token decryption."""
         instances = await super().get_all(order_by=order_by)
         for instance in instances:
             if instance.api_key:
@@ -141,6 +202,17 @@ class Credential(ObjectModel):
                 )
                 decrypted = decrypt_value(raw)
                 object.__setattr__(instance, "api_key", SecretStr(decrypted))
+            # Decrypt OAuth secret fields
+            for token_field in ("oauth_access_token", "oauth_refresh_token", "oauth_api_key"):
+                token_val = getattr(instance, token_field, None)
+                if token_val:
+                    raw = (
+                        token_val.get_secret_value()
+                        if isinstance(token_val, SecretStr)
+                        else token_val
+                    )
+                    decrypted = decrypt_value(raw)
+                    object.__setattr__(instance, token_field, SecretStr(decrypted))
         return instances
 
     async def get_linked_models(self) -> list:
@@ -155,45 +227,62 @@ class Credential(ObjectModel):
         )
         return [Model(**row) for row in results]
 
+    _SECRET_FIELDS = {"api_key", "oauth_access_token", "oauth_refresh_token", "oauth_api_key"}
+
     def _prepare_save_data(self) -> Dict[str, Any]:
-        """Override to encrypt api_key before storage."""
+        """Override to encrypt api_key and OAuth tokens before storage."""
         data = {}
         for key, value in self.model_dump().items():
-            if key == "api_key":
-                # Handle SecretStr: extract, encrypt, store
-                if self.api_key:
-                    secret_value = self.api_key.get_secret_value()
-                    data["api_key"] = encrypt_value(secret_value)
+            if key in self._SECRET_FIELDS:
+                # Handle SecretStr fields: extract, encrypt, store
+                field_val = getattr(self, key, None)
+                if field_val:
+                    secret_value = field_val.get_secret_value()
+                    data[key] = encrypt_value(secret_value)
                 else:
-                    data["api_key"] = None
+                    data[key] = None
             elif value is not None or key in self.__class__.nullable_fields:
                 data[key] = value
 
         return data
 
     async def save(self) -> None:
-        """Save credential, handling api_key re-hydration after DB round-trip."""
-        # Remember the original SecretStr before save
-        original_api_key = self.api_key
+        """Save credential, handling secret field re-hydration after DB round-trip."""
+        # Remember the original SecretStr values before save
+        originals = {
+            field: getattr(self, field, None)
+            for field in self._SECRET_FIELDS
+        }
 
         await super().save()
 
-        # After save, the api_key field may be set to the encrypted string
-        # from the DB result. Restore the original SecretStr.
-        if original_api_key:
-            object.__setattr__(self, "api_key", original_api_key)
-        elif self.api_key and isinstance(self.api_key, str):
-            # Decrypt if DB returned an encrypted string
-            decrypted = decrypt_value(self.api_key)
-            object.__setattr__(self, "api_key", SecretStr(decrypted))
+        # After save, secret fields may be set to encrypted strings from
+        # the DB result. Restore the original SecretStr values.
+        for field, original in originals.items():
+            if original:
+                object.__setattr__(self, field, original)
+            else:
+                current = getattr(self, field, None)
+                if current and isinstance(current, str):
+                    decrypted = decrypt_value(current)
+                    object.__setattr__(self, field, SecretStr(decrypted))
 
     @classmethod
     def _from_db_row(cls, row: dict) -> "Credential":
-        """Create a Credential from a database row, decrypting api_key."""
-        api_key_val = row.get("api_key")
-        if api_key_val and isinstance(api_key_val, str):
-            decrypted = decrypt_value(api_key_val)
-            row["api_key"] = SecretStr(decrypted)
-        elif api_key_val is None:
-            row["api_key"] = None
+        """Create a Credential from a database row, decrypting secret fields."""
+        for field in ("api_key", "oauth_access_token", "oauth_refresh_token", "oauth_api_key"):
+            val = row.get(field)
+            if val and isinstance(val, str):
+                decrypted = decrypt_value(val)
+                row[field] = SecretStr(decrypted)
+            elif val is None:
+                row[field] = None
         return cls(**row)
+
+    def is_oauth_token_expired(self) -> bool:
+        """Check if the OAuth access token has expired or is near expiry."""
+        if self.auth_type != "oauth" or not self.oauth_token_expiry:
+            return False
+        # Consider expired if within 5 minutes of expiry
+        buffer = timedelta(minutes=5)
+        return datetime.now(timezone.utc) >= self.oauth_token_expiry - buffer

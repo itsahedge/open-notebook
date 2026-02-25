@@ -122,6 +122,12 @@ class Credential(ObjectModel):
                 # Pass account ID as extra config for callers that need it
                 if self.oauth_account_id:
                     config["chatgpt_account_id"] = self.oauth_account_id
+            elif self.api_key:
+                # Path 3: Setup-token (e.g. Anthropic Claude Code) — stored
+                # in api_key but marked as auth_type=oauth. The caller
+                # (models.py) detects the token format and routes to the
+                # appropriate adapter (e.g. AnthropicOAuthLanguageModelWrapper).
+                config["api_key"] = self.api_key.get_secret_value()
         elif self.api_key:
             config["api_key"] = self.api_key.get_secret_value()
 

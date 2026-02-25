@@ -62,8 +62,10 @@ router = APIRouter(prefix="/oauth", tags=["oauth"])
 
 # Common Claude models to auto-register after credential creation
 ANTHROPIC_SETUP_TOKEN_MODELS = [
-    ("claude-opus-4-20250514", "language"),
-    ("claude-sonnet-4-20250514", "language"),
+    ("claude-opus-4-6", "language"),
+    ("claude-opus-4-5", "language"),
+    ("claude-sonnet-4-6", "language"),
+    ("claude-sonnet-4-5", "language"),
     ("claude-3-5-haiku-20241022", "language"),
 ]
 

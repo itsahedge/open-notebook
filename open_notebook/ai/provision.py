@@ -3,6 +3,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from loguru import logger
 
 from open_notebook.ai.models import model_manager
+from open_notebook.auth.anthropic_langchain import AnthropicOAuthLanguageModelWrapper
 from open_notebook.auth.chatgpt_langchain import ChatGPTLanguageModelWrapper
 from open_notebook.exceptions import ConfigurationError
 from open_notebook.utils import token_count
@@ -48,7 +49,7 @@ async def provision_langchain_model(
             f"Please go to Settings → Models and configure a default model for '{default_type}'."
         )
 
-    if not isinstance(model, (LanguageModel, ChatGPTLanguageModelWrapper)):
+    if not isinstance(model, (LanguageModel, ChatGPTLanguageModelWrapper, AnthropicOAuthLanguageModelWrapper)):
         logger.error(
             f"Model type mismatch: Expected LanguageModel but got {type(model).__name__}. "
             f"Selection reason: {selection_reason}. "

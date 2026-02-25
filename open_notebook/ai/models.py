@@ -9,6 +9,7 @@ from esperanto import (
 )
 from loguru import logger
 
+from open_notebook.auth.anthropic_adapter import is_anthropic_oauth_token
 from open_notebook.database.repository import ensure_record_id, repo_query
 from open_notebook.domain.base import ObjectModel, RecordModel
 from open_notebook.exceptions import ConfigurationError
@@ -191,6 +192,32 @@ class ModelManager:
                 logger.warning(
                     f"ChatGPT backend credential for model {model.name} is missing "
                     f"access_token or account_id — falling through to Esperanto."
+                )
+
+        # -----------------------------------------------------------------
+        # Anthropic OAuth detection: if the credential stores an OAuth
+        # setup-token (sk-ant-oat01-...), route through the Anthropic
+        # OAuth adapter which uses Bearer auth + Claude Code headers.
+        # -----------------------------------------------------------------
+        if (
+            model.type == "language"
+            and model.credential
+            and credential is not None
+            and credential.auth_type == "oauth"
+            and credential.provider.lower() == "anthropic"
+        ):
+            api_key = config.get("api_key", "")
+            if api_key and is_anthropic_oauth_token(api_key):
+                from open_notebook.auth.anthropic_langchain import (
+                    AnthropicOAuthLanguageModelWrapper,
+                )
+
+                logger.info(
+                    f"Using Anthropic OAuth adapter (Bearer auth) for model {model.name}"
+                )
+                return AnthropicOAuthLanguageModelWrapper(
+                    model_name=model.name,
+                    api_key=api_key,
                 )
 
         # Normalize provider name: DB stores underscores but Esperanto expects hyphens

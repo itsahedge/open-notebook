@@ -623,6 +623,8 @@ class CredentialResponse(BaseModel):
     oauth_provider: Optional[str] = None
     has_oauth_tokens: bool = False
     oauth_token_expiry: Optional[str] = None
+    # Which OAuth path is active: "api_key" (exchanged key), "chatgpt_backend", or None
+    oauth_path: Optional[str] = None
 
 
 class CredentialDeleteResponse(BaseModel):

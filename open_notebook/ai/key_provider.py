@@ -144,7 +144,9 @@ async def get_api_key(provider: str) -> Optional[str]:
     """
     Get API key for a provider. Checks database first, then env var.
 
-    For OAuth credentials, returns the access token (auto-refreshed if expired).
+    For OAuth credentials, prefers the exchanged API key (oauth_api_key) if
+    available (standard API path). Falls back to oauth_access_token for the
+    ChatGPT backend path. Auto-refreshes expired tokens.
 
     Args:
         provider: Provider name (openai, anthropic, etc.)
@@ -154,11 +156,19 @@ async def get_api_key(provider: str) -> Optional[str]:
     """
     cred = await _get_default_credential(provider)
     if cred:
-        # OAuth credential: use access token
-        if cred.auth_type == "oauth" and cred.oauth_access_token:
+        # OAuth credential: two paths
+        if cred.auth_type == "oauth":
             cred = await _refresh_oauth_token_if_needed(cred)
-            logger.debug(f"Using {provider} OAuth access token from Credential")
-            return cred.oauth_access_token.get_secret_value()
+
+            # Path 1: exchanged API key (standard API endpoint)
+            if cred.oauth_api_key:
+                logger.debug(f"Using {provider} OAuth exchanged API key from Credential")
+                return cred.oauth_api_key.get_secret_value()
+
+            # Path 2: access token (ChatGPT backend or other OAuth provider)
+            if cred.oauth_access_token:
+                logger.debug(f"Using {provider} OAuth access token from Credential")
+                return cred.oauth_access_token.get_secret_value()
 
         # API key credential
         if cred.api_key:
@@ -196,15 +206,23 @@ async def _provision_simple_provider(provider: str) -> bool:
     if not cred:
         return False
 
-    # OAuth credential: use access token as API key, set OAuth base URL
-    if cred.auth_type == "oauth" and cred.oauth_access_token:
+    # OAuth credential: two paths for API key resolution
+    if cred.auth_type == "oauth":
         cred = await _refresh_oauth_token_if_needed(cred)
-        os.environ[env_var] = cred.oauth_access_token.get_secret_value()
-        logger.debug(f"Set {env_var} from OAuth Credential")
-        if cred.oauth_base_url:
-            provider_upper = provider_lower.upper()
-            os.environ[f"{provider_upper}_API_BASE"] = cred.oauth_base_url
-            logger.debug(f"Set {provider_upper}_API_BASE from OAuth Credential")
+
+        if cred.oauth_api_key:
+            # Path 1: exchanged API key → standard API endpoint
+            os.environ[env_var] = cred.oauth_api_key.get_secret_value()
+            logger.debug(f"Set {env_var} from OAuth exchanged API key")
+            # Don't set a custom base URL — use the provider's default
+        elif cred.oauth_access_token:
+            # Path 2: access token → ChatGPT backend (or provider-specific URL)
+            os.environ[env_var] = cred.oauth_access_token.get_secret_value()
+            logger.debug(f"Set {env_var} from OAuth access token")
+            if cred.oauth_base_url:
+                provider_upper = provider_lower.upper()
+                os.environ[f"{provider_upper}_API_BASE"] = cred.oauth_base_url
+                logger.debug(f"Set {provider_upper}_API_BASE from OAuth Credential")
         return True
 
     # API key credential

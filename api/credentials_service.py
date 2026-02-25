@@ -225,6 +225,11 @@ def credential_to_response(cred: Credential, model_count: int = 0) -> Credential
         oauth_token_expiry=(
             str(cred.oauth_token_expiry) if cred.oauth_token_expiry else None
         ),
+        oauth_path=(
+            "api_key" if cred.oauth_api_key
+            else "chatgpt_backend" if (cred.auth_type == "oauth" and cred.oauth_access_token)
+            else None
+        ),
     )
 
 

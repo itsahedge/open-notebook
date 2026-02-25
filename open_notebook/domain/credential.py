@@ -53,6 +53,8 @@ class Credential(ObjectModel):
         "oauth_provider",
         "oauth_client_id",
         "oauth_base_url",
+        "oauth_api_key",
+        "oauth_account_id",
     }
 
     name: str
@@ -78,6 +80,11 @@ class Credential(ObjectModel):
     oauth_provider: Optional[str] = None  # "openai", "anthropic", etc.
     oauth_client_id: Optional[str] = None
     oauth_base_url: Optional[str] = None  # base URL for OAuth-authenticated requests
+    # OpenAI two-path fields:
+    # oauth_api_key: exchanged API key (if token-exchange grant succeeded → standard API path)
+    # oauth_account_id: chatgpt_account_id from JWT (needed for ChatGPT backend path)
+    oauth_api_key: Optional[SecretStr] = None
+    oauth_account_id: Optional[str] = None
 
     def to_esperanto_config(self) -> Dict[str, Any]:
         """
@@ -86,16 +93,35 @@ class Credential(ObjectModel):
         Returns a dict that can be passed as the 'config' parameter to
         Esperanto's AIFactory methods, overriding env var lookup.
 
-        For OAuth credentials, uses the OAuth access token as api_key and
-        sets base_url to the OAuth-specific endpoint.
+        For OAuth credentials, resolves one of two paths:
+
+        1. **API key path** (oauth_api_key is set): The token-exchange grant
+           succeeded — use the exchanged API key against the standard
+           api.openai.com endpoint. This behaves identically to a normal
+           API key credential.
+
+        2. **ChatGPT backend path** (oauth_api_key is NOT set): The account
+           is ChatGPT-only — use the OAuth access_token as Bearer auth
+           against the ChatGPT backend (oauth_base_url). The caller may
+           also need oauth_account_id for the chatgpt-account-id header.
         """
         config: Dict[str, Any] = {}
 
-        if self.auth_type == "oauth" and self.oauth_access_token:
-            # OAuth: use access token as API key, use OAuth base URL
-            config["api_key"] = self.oauth_access_token.get_secret_value()
-            if self.oauth_base_url:
-                config["base_url"] = self.oauth_base_url
+        if self.auth_type == "oauth":
+            if self.oauth_api_key:
+                # Path 1: exchanged API key → standard API endpoint
+                config["api_key"] = self.oauth_api_key.get_secret_value()
+                # base_url stays default (api.openai.com/v1) — don't set it
+                # so that Esperanto uses the provider's normal base URL.
+            elif self.oauth_access_token:
+                # Path 2: ChatGPT backend — access_token as API key,
+                # different base_url
+                config["api_key"] = self.oauth_access_token.get_secret_value()
+                if self.oauth_base_url:
+                    config["base_url"] = self.oauth_base_url
+                # Pass account ID as extra config for callers that need it
+                if self.oauth_account_id:
+                    config["chatgpt_account_id"] = self.oauth_account_id
         elif self.api_key:
             config["api_key"] = self.api_key.get_secret_value()
 
@@ -150,8 +176,8 @@ class Credential(ObjectModel):
             )
             decrypted = decrypt_value(raw)
             object.__setattr__(instance, "api_key", SecretStr(decrypted))
-        # Decrypt OAuth tokens
-        for token_field in ("oauth_access_token", "oauth_refresh_token"):
+        # Decrypt OAuth secret fields
+        for token_field in ("oauth_access_token", "oauth_refresh_token", "oauth_api_key"):
             token_val = getattr(instance, token_field, None)
             if token_val:
                 raw = (
@@ -176,8 +202,8 @@ class Credential(ObjectModel):
                 )
                 decrypted = decrypt_value(raw)
                 object.__setattr__(instance, "api_key", SecretStr(decrypted))
-            # Decrypt OAuth tokens
-            for token_field in ("oauth_access_token", "oauth_refresh_token"):
+            # Decrypt OAuth secret fields
+            for token_field in ("oauth_access_token", "oauth_refresh_token", "oauth_api_key"):
                 token_val = getattr(instance, token_field, None)
                 if token_val:
                     raw = (
@@ -201,7 +227,7 @@ class Credential(ObjectModel):
         )
         return [Model(**row) for row in results]
 
-    _SECRET_FIELDS = {"api_key", "oauth_access_token", "oauth_refresh_token"}
+    _SECRET_FIELDS = {"api_key", "oauth_access_token", "oauth_refresh_token", "oauth_api_key"}
 
     def _prepare_save_data(self) -> Dict[str, Any]:
         """Override to encrypt api_key and OAuth tokens before storage."""
@@ -244,7 +270,7 @@ class Credential(ObjectModel):
     @classmethod
     def _from_db_row(cls, row: dict) -> "Credential":
         """Create a Credential from a database row, decrypting secret fields."""
-        for field in ("api_key", "oauth_access_token", "oauth_refresh_token"):
+        for field in ("api_key", "oauth_access_token", "oauth_refresh_token", "oauth_api_key"):
             val = row.get(field)
             if val and isinstance(val, str):
                 decrypted = decrypt_value(val)

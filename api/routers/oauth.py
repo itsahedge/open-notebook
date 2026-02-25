@@ -4,6 +4,18 @@ OAuth Router
 Handles OAuth authorization flows for AI providers (OpenAI, Anthropic, etc.).
 Creates/updates Credential records with OAuth tokens.
 
+OpenAI has TWO paths after authentication:
+
+1. **API key path**: After getting id_token via OAuth, try token-exchange
+   grant (urn:ietf:params:oauth:grant-type:token-exchange) to get a real
+   API key. If successful → store as oauth_api_key, use against
+   api.openai.com just like a normal key.
+
+2. **ChatGPT backend path** (fallback for ChatGPT-only subscriptions):
+   When API key exchange fails, use the OAuth access_token as Bearer auth
+   against https://chatgpt.com/backend-api/. Requires chatgpt-account-id
+   header extracted from the JWT id_token.
+
 Endpoints:
 - GET  /oauth/{provider}/authorize          - Get authorization URL
 - POST /oauth/{provider}/callback           - Exchange code for tokens
@@ -33,6 +45,8 @@ from api.models import (
 from open_notebook.auth.oauth_providers import (
     build_authorize_url,
     exchange_code_for_tokens,
+    exchange_token_for_api_key,
+    extract_account_id_from_jwt,
     generate_pkce_pair,
     get_oauth_provider,
     refresh_access_token,
@@ -64,8 +78,7 @@ async def oauth_authorize(provider: str, redirect_uri: str):
             code_challenge=code_challenge if config.use_pkce else None,
         )
 
-        # Store the code_verifier in the state for the callback
-        # The frontend must send it back in the callback request
+        # The frontend must store code_verifier and send it back in the callback
         logger.info(f"Generated OAuth authorization URL for {provider}")
 
         return OAuthAuthorizeResponse(
@@ -85,13 +98,20 @@ async def oauth_callback(provider: str, request: OAuthCallbackRequest):
     """
     Handle the OAuth callback by exchanging the authorization code for tokens.
 
+    For OpenAI, this implements the two-path flow:
+
+    1. Exchange authorization code for tokens (access_token, id_token, etc.)
+    2. Try to exchange the id_token for a real API key (token-exchange grant)
+       - If successful → store oauth_api_key, use standard api.openai.com
+       - If fails → extract chatgpt_account_id from JWT, use ChatGPT backend
+
     Creates a new Credential record with auth_type="oauth" storing the
     encrypted tokens.
     """
     try:
         require_encryption_key()
 
-        # Exchange code for tokens
+        # Step 1: Exchange authorization code for tokens
         token_data = await exchange_code_for_tokens(
             provider=provider,
             code=request.code,
@@ -101,6 +121,7 @@ async def oauth_callback(provider: str, request: OAuthCallbackRequest):
 
         access_token = token_data.get("access_token")
         refresh_token = token_data.get("refresh_token")
+        id_token = token_data.get("id_token")
         expires_in = token_data.get("expires_in", 3600)
 
         if not access_token:
@@ -109,12 +130,52 @@ async def oauth_callback(provider: str, request: OAuthCallbackRequest):
         # Compute token expiry
         token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-        # Get the OAuth provider config for the base URL
+        # Get the OAuth provider config
         config = get_oauth_provider(provider)
+
+        # Step 2: For providers that support it, try API key exchange
+        exchanged_api_key: str | None = None
+        account_id: str | None = None
+        oauth_base_url: str | None = None
+        credential_name_suffix = "OAuth"
+
+        if config.supports_api_key_exchange and id_token:
+            exchanged_api_key = await exchange_token_for_api_key(
+                provider=provider,
+                id_token=id_token,
+            )
+
+        if exchanged_api_key:
+            # Path 1: API key exchange succeeded → standard API path
+            # No special base_url needed — uses default api.openai.com/v1
+            credential_name_suffix = "OAuth - API Key"
+            logger.info(
+                f"OpenAI OAuth: API key exchange succeeded. "
+                f"Using standard API path."
+            )
+        else:
+            # Path 2: ChatGPT backend path (or non-OpenAI provider)
+            oauth_base_url = config.chatgpt_base_url or config.api_base_url
+
+            # Extract account_id from JWT for ChatGPT backend auth
+            if id_token:
+                account_id = extract_account_id_from_jwt(id_token)
+                if account_id:
+                    credential_name_suffix = "OAuth - ChatGPT"
+                    logger.info(
+                        f"OpenAI OAuth: using ChatGPT backend path "
+                        f"(account_id={account_id[:8]}...)"
+                    )
+                else:
+                    credential_name_suffix = "OAuth - ChatGPT (no account ID)"
+                    logger.warning(
+                        "OpenAI OAuth: ChatGPT backend path but "
+                        "could not extract account_id from JWT"
+                    )
 
         # Create a new Credential with OAuth tokens
         cred = Credential(
-            name=f"{provider.title()} (OAuth)",
+            name=f"{provider.title()} ({credential_name_suffix})",
             provider=provider,
             modalities=get_default_modalities(provider),
             auth_type="oauth",
@@ -123,7 +184,9 @@ async def oauth_callback(provider: str, request: OAuthCallbackRequest):
             oauth_token_expiry=token_expiry,
             oauth_provider=provider,
             oauth_client_id=config.client_id,
-            oauth_base_url=config.api_base_url,
+            oauth_base_url=oauth_base_url,
+            oauth_api_key=SecretStr(exchanged_api_key) if exchanged_api_key else None,
+            oauth_account_id=account_id,
         )
 
         await cred.save()
@@ -149,6 +212,10 @@ async def oauth_refresh(provider: str, credential_id: str):
     This is typically not needed as token refresh happens automatically
     when using the credential, but can be useful for testing or
     pre-emptive refresh.
+
+    After refreshing, re-attempts the API key exchange for providers that
+    support it (the new id_token may grant API key access if the account
+    was upgraded).
     """
     try:
         require_encryption_key()
@@ -178,6 +245,28 @@ async def oauth_refresh(provider: str, credential_id: str):
         expires_in = token_data.get("expires_in", 3600)
         new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
         object.__setattr__(cred, "oauth_token_expiry", new_expiry)
+
+        # If refresh returned a new id_token, re-attempt API key exchange
+        new_id_token = token_data.get("id_token")
+        if new_id_token:
+            config = get_oauth_provider(provider)
+            if config.supports_api_key_exchange:
+                new_api_key = await exchange_token_for_api_key(
+                    provider=provider,
+                    id_token=new_id_token,
+                )
+                if new_api_key:
+                    object.__setattr__(cred, "oauth_api_key", SecretStr(new_api_key))
+                    # Clear ChatGPT-specific base URL since we now have an API key
+                    object.__setattr__(cred, "oauth_base_url", None)
+                    logger.info(
+                        f"API key exchange succeeded on refresh for {cred.id}"
+                    )
+
+            # Also re-extract account_id in case it changed
+            account_id = extract_account_id_from_jwt(new_id_token)
+            if account_id:
+                object.__setattr__(cred, "oauth_account_id", account_id)
 
         await cred.save()
 

@@ -563,6 +563,7 @@ class CreateCredentialRequest(BaseModel):
         default_factory=list,
         description="Supported modalities (language, embedding, text_to_speech, speech_to_text)",
     )
+    auth_type: str = Field("api_key", description="Authentication type: api_key or oauth")
     api_key: Optional[str] = Field(None, description="API key (stored encrypted)")
     base_url: Optional[str] = Field(None, description="Base URL")
     endpoint: Optional[str] = Field(None, description="Endpoint URL (Azure)")
@@ -597,7 +598,7 @@ class UpdateCredentialRequest(BaseModel):
 
 
 class CredentialResponse(BaseModel):
-    """Response for a credential (never includes api_key)."""
+    """Response for a credential (never includes api_key or tokens)."""
 
     id: str
     name: str
@@ -617,6 +618,11 @@ class CredentialResponse(BaseModel):
     created: str
     updated: str
     model_count: int = 0
+    # OAuth fields (never expose tokens)
+    auth_type: str = "api_key"
+    oauth_provider: Optional[str] = None
+    has_oauth_tokens: bool = False
+    oauth_token_expiry: Optional[str] = None
 
 
 class CredentialDeleteResponse(BaseModel):
@@ -662,6 +668,33 @@ class RegisterModelsResponse(BaseModel):
 
     created: int
     existing: int
+
+
+# OAuth models
+class OAuthAuthorizeResponse(BaseModel):
+    """Response with the OAuth authorization URL."""
+
+    authorize_url: str = Field(..., description="URL to redirect user for OAuth authorization")
+    state: str = Field(..., description="CSRF state parameter to verify on callback")
+
+
+class OAuthCallbackRequest(BaseModel):
+    """Request body for the OAuth callback (code exchange)."""
+
+    code: str = Field(..., description="Authorization code from OAuth provider")
+    state: str = Field(..., description="State parameter for CSRF verification")
+    code_verifier: Optional[str] = Field(
+        None, description="PKCE code verifier (required for PKCE flows)"
+    )
+    redirect_uri: str = Field(..., description="Redirect URI used in the authorization request")
+
+
+class OAuthTokenRefreshResponse(BaseModel):
+    """Response from a manual token refresh."""
+
+    success: bool
+    expires_at: Optional[str] = None
+    message: str = ""
 
 
 class NotebookDeletePreview(BaseModel):

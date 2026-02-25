@@ -22,6 +22,12 @@ services:
       # This encrypts your API keys in the database
       - OPEN_NOTEBOOK_ENCRYPTION_KEY=change-me-to-a-secret-string
 
+      # OAuth configuration (optional - for OAuth integration with AI providers)
+      # - OPENAI_OAUTH_CLIENT_ID=your-openai-oauth-client-id
+      # - OPENAI_OAUTH_CLIENT_SECRET=your-openai-oauth-client-secret
+      # - ANTHROPIC_OAUTH_CLIENT_ID=your-anthropic-oauth-client-id
+      # - ANTHROPIC_OAUTH_CLIENT_SECRET=your-anthropic-oauth-client-secret
+
       # Database connection (default values - no need to change)
       - SURREAL_URL=ws://surrealdb:8000/rpc
       - SURREAL_USER=root

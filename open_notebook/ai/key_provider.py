@@ -5,6 +5,9 @@ This module provides a unified interface for retrieving API keys and provider
 configuration. It reads from Credential records (individual per-provider
 credentials) and falls back to environment variables for backward compatibility.
 
+For OAuth credentials, it automatically handles token refresh when tokens
+are expired or near expiry.
+
 Usage:
     from open_notebook.ai.key_provider import provision_provider_keys
 
@@ -13,9 +16,11 @@ Usage:
 """
 
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from loguru import logger
+from pydantic import SecretStr
 
 from open_notebook.domain.credential import Credential
 
@@ -76,9 +81,70 @@ async def _get_default_credential(provider: str) -> Optional[Credential]:
     return None
 
 
+async def _refresh_oauth_token_if_needed(cred: Credential) -> Credential:
+    """
+    Check if an OAuth credential's token is expired and refresh if needed.
+
+    Args:
+        cred: A Credential with auth_type == "oauth"
+
+    Returns:
+        The credential (updated in-place and saved if refreshed)
+    """
+    if not cred.is_oauth_token_expired():
+        return cred
+
+    if not cred.oauth_refresh_token:
+        logger.warning(
+            f"OAuth token expired for credential {cred.id} but no refresh token available"
+        )
+        return cred
+
+    if not cred.oauth_provider:
+        logger.warning(
+            f"OAuth token expired for credential {cred.id} but no oauth_provider set"
+        )
+        return cred
+
+    try:
+        from open_notebook.auth.oauth_providers import refresh_access_token
+
+        token_data = await refresh_access_token(
+            cred.oauth_provider,
+            cred.oauth_refresh_token.get_secret_value(),
+        )
+
+        # Update credential with new tokens
+        object.__setattr__(
+            cred, "oauth_access_token", SecretStr(token_data["access_token"])
+        )
+
+        # Some providers rotate refresh tokens
+        if "refresh_token" in token_data:
+            object.__setattr__(
+                cred, "oauth_refresh_token", SecretStr(token_data["refresh_token"])
+            )
+
+        # Update expiry
+        expires_in = token_data.get("expires_in", 3600)
+        new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        object.__setattr__(cred, "oauth_token_expiry", new_expiry)
+
+        # Persist the refreshed tokens
+        await cred.save()
+        logger.info(f"Successfully refreshed OAuth token for credential {cred.id}")
+
+    except Exception as e:
+        logger.error(f"Failed to refresh OAuth token for credential {cred.id}: {e}")
+
+    return cred
+
+
 async def get_api_key(provider: str) -> Optional[str]:
     """
     Get API key for a provider. Checks database first, then env var.
+
+    For OAuth credentials, returns the access token (auto-refreshed if expired).
 
     Args:
         provider: Provider name (openai, anthropic, etc.)
@@ -87,9 +153,17 @@ async def get_api_key(provider: str) -> Optional[str]:
         API key string or None if not configured
     """
     cred = await _get_default_credential(provider)
-    if cred and cred.api_key:
-        logger.debug(f"Using {provider} API key from Credential")
-        return cred.api_key.get_secret_value()
+    if cred:
+        # OAuth credential: use access token
+        if cred.auth_type == "oauth" and cred.oauth_access_token:
+            cred = await _refresh_oauth_token_if_needed(cred)
+            logger.debug(f"Using {provider} OAuth access token from Credential")
+            return cred.oauth_access_token.get_secret_value()
+
+        # API key credential
+        if cred.api_key:
+            logger.debug(f"Using {provider} API key from Credential")
+            return cred.api_key.get_secret_value()
 
     # Fall back to environment variable
     config_info = PROVIDER_CONFIG.get(provider.lower())
@@ -106,6 +180,8 @@ async def _provision_simple_provider(provider: str) -> bool:
     """
     Set environment variable for a simple provider from DB config.
 
+    Handles both API key and OAuth credentials.
+
     Returns:
         True if key was set from database, False otherwise
     """
@@ -120,7 +196,18 @@ async def _provision_simple_provider(provider: str) -> bool:
     if not cred:
         return False
 
-    # Set API key / primary env var
+    # OAuth credential: use access token as API key, set OAuth base URL
+    if cred.auth_type == "oauth" and cred.oauth_access_token:
+        cred = await _refresh_oauth_token_if_needed(cred)
+        os.environ[env_var] = cred.oauth_access_token.get_secret_value()
+        logger.debug(f"Set {env_var} from OAuth Credential")
+        if cred.oauth_base_url:
+            provider_upper = provider_lower.upper()
+            os.environ[f"{provider_upper}_API_BASE"] = cred.oauth_base_url
+            logger.debug(f"Set {provider_upper}_API_BASE from OAuth Credential")
+        return True
+
+    # API key credential
     if cred.api_key:
         os.environ[env_var] = cred.api_key.get_secret_value()
         logger.debug(f"Set {env_var} from Credential")
